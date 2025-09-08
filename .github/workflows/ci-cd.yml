@@ -1,315 +1,173 @@
-name: CI - User Auth Service Build & Test
+name: CI/CD - Data Upload Service
 
 on:
+  # Trigger build/test on pushes to any branch
   push:
     branches:
-      - main
+      - '**'
+  
+  # Trigger build/test for pull requests targeting main
   pull_request:
     branches:
       - main
 
-env:
-  DOCKER_IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/user-auth-service
-  SERVICE_NAME: userAuthService
+  # Allow manual triggering for deployment or rollbacks
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment (namespace)'
+        required: true
+        default: 'analytics'
+        type: choice
+        options:
+          - analytics
+          - staging
+          - production
+      image_tag:
+        description: 'OPTIONAL: Specific image tag to deploy (for rollback)'
+        required: false
+        type: string
 
-permissions:
-  contents: read
+env:
+  DOCKER_IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/data-upload-service
+  SERVICE_NAME: dataUploadService # From your Helm values.yaml
+  HELM_RELEASE_NAME: data-upload-service # The release name in Kubernetes
 
 jobs:
-  # Job 1: Static Analysis & Security Checks
-  static-analysis:
+  # ==================================
+  # CI STAGE: Build & Test
+  # ==================================
+  build-and-test:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js v18
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run ESLint
-        run: npm run lint || true
-        continue-on-error: true
-
-      - name: Run Security Audit
-        run: npm audit --audit-level high || true
-        continue-on-error: true
-
-      - name: Check for vulnerabilities
-        run: |
-          npm audit --json > audit-results.json || true
-          echo "Security audit completed"
-
-      - name: Upload audit results
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-audit-results
-          path: audit-results.json
-          retention-days: 30
-
-  # Job 2: Run Tests
-  test:
-    runs-on: ubuntu-latest
-    needs: static-analysis
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js v18
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run unit tests
-        run: |
-          if npm run test:coverage 2>/dev/null; then
-            echo "Tests with coverage completed"
-          elif npm test 2>/dev/null; then
-            echo "Tests completed"
-          else
-            echo "No test script found, skipping tests"
-          fi
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: |
-            coverage/
-            test-results.xml
-          if-no-files-found: ignore
-          retention-days: 30
-
-  # Job 3: Build, Scan, and Push Docker Image
-  build-and-push:
-    runs-on: ubuntu-latest
-    needs: test
     outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
-      git-sha: ${{ steps.vars.outputs.git-sha }}
+      image_tag: ${{ steps.vars.outputs.image_tag }}
 
     steps:
-      - name: Checkout service repo code
+      - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Setup Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter and security audit
+        run: |
+          npm run lint || true
+          npm audit --audit-level high || true
+
+      - name: Run tests
+        run: npm test
 
       - name: Set build variables
         id: vars
         run: |
-          echo "git-sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "build-date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
-          echo "build-number=${{ github.run_number }}" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          IMAGE_TAG=${{ github.sha }}
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
       - name: Login to Docker Hub
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
       - name: Build and push Docker image
-        id: build
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: |
+            ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
             ${{ env.DOCKER_IMAGE_NAME }}:latest
-            ${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.DOCKER_IMAGE_NAME }}:build-${{ github.run_number }}
-          labels: |
-            org.opencontainers.image.title=User Auth Service
-            org.opencontainers.image.description=Authentication service for analytics platform
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.created=${{ steps.vars.outputs.build-date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Save build info
-        run: |
-          mkdir -p build-info
-          echo "${{ steps.vars.outputs.git-sha }}" > build-info/GIT_SHA.txt
-          echo "${{ steps.vars.outputs.build-date }}" > build-info/BUILD_DATE.txt
-          echo "${{ steps.vars.outputs.build-number }}" > build-info/BUILD_NUMBER.txt
-          echo "${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}" > build-info/IMAGE_TAG.txt
-
-      - name: Upload build info
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-info-user-auth
-          path: build-info/
-          retention-days: 30
-
-      # Container Security Scanning
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        continue-on-error: true
-        with:
-          image-ref: ${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-
-      - name: Upload Trivy scan results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: trivy-security-scan
-          path: trivy-results.sarif
-          retention-days: 30
-
-  # Job 4: Update Helm Chart
-  update-helm-chart:
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    if: github.ref == 'refs/heads/main' # Only update chart on main branch
+  # ==================================
+  # CD STAGE: Deploy to Kubernetes
+  # ==================================
+  deploy-to-kubernetes:
+    runs-on: self-hosted
+    needs: build-and-test
+    # IMPORTANT: This job only runs on a push to 'main' or a manual dispatch.
+    # It will NOT run for pull requests or pushes to other branches.
+    if: success() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
 
     steps:
-      - name: Clone the infra repository
+      - name: Checkout infrastructure repository with Helm chart
         uses: actions/checkout@v4
         with:
-          repository: subanalytics/infra-and-cicd
+          repository: subanalytics/infra-and-cicd # REPO WITH YOUR HELM CHART
           path: infra-and-cicd
-          token: ${{ secrets.GH_PAT }}
+          token: ${{ secrets.GH_PAT }} # PAT to access the infra repo
 
-      - name: Download build info
-        uses: actions/download-artifact@v4
-        with:
-          name: build-info-user-auth
-          path: build-info/
-
-      - name: Read build variables
+      - name: Configure kubectl
         run: |
-          echo "GIT_SHA=$(cat build-info/GIT_SHA.txt)" >> $GITHUB_ENV
-          echo "BUILD_DATE=$(cat build-info/BUILD_DATE.txt)" >> $GITHUB_ENV
-          echo "IMAGE_TAG=$(cat build-info/IMAGE_TAG.txt)" >> $GITHUB_ENV
+          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 --decode > kubeconfig.yaml
+          echo "KUBECONFIG=$PWD/kubeconfig.yaml" >> $GITHUB_ENV
 
-      - name: Update image tag in values.yaml
-        run: |
-          # Install yq if not available
-          if ! command -v yq &> /dev/null; then
-            sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq && sudo chmod +x /usr/bin/yq
-          fi
-          
-          cd infra-and-cicd
-          
-          # Update image tag
-          yq e -i '.${{ env.SERVICE_NAME }}.image.tag = "${{ github.sha }}"' values.yaml
-          
-          # Update metadata if fields exist
-          yq e -i '.${{ env.SERVICE_NAME }}.metadata.buildDate = "${{ env.BUILD_DATE }}" // .${{ env.SERVICE_NAME }}.metadata.buildDate' values.yaml
-          yq e -i '.${{ env.SERVICE_NAME }}.metadata.gitSha = "${{ env.GIT_SHA }}" // .${{ env.SERVICE_NAME }}.metadata.gitSha' values.yaml
-          yq e -i '.${{ env.SERVICE_NAME }}.metadata.buildNumber = "${{ github.run_number }}" // .${{ env.SERVICE_NAME }}.metadata.buildNumber' values.yaml
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
 
-      - name: Validate Helm chart
+      - name: Set Deployment Variables
+        id: vars
         run: |
-          cd infra-and-cicd
-          
-          # Install Helm if not available
-          if ! command -v helm &> /dev/null; then
-            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-          fi
-          
-          # Validate the chart syntax
-          helm lint . || echo "Helm lint completed with warnings"
-          
-          # Dry run to validate template rendering
-          helm template test-release . --dry-run > /dev/null && echo "✅ Helm template validation passed"
-
-      - name: Commit and push the updated values.yaml
-        run: |
-          cd infra-and-cicd
-          git config user.name "GitHub Actions Bot"
-          git config user.email "actions@github.com"
-          
-          # Add all changes
-          git add values.yaml
-          
-          if ! git diff --staged --quiet; then
-            # Create detailed commit message
-            cat > commit_message.txt << EOF
-          ci: Update ${{ env.SERVICE_NAME }} image tag to ${{ github.sha }}
-          
-          - Image: ${{ env.IMAGE_TAG }}
-          - Build Date: ${{ env.BUILD_DATE }}
-          - Build Number: ${{ github.run_number }}
-          - Git SHA: ${{ env.GIT_SHA }}
-          - Repository: ${{ github.repository }}
-          - Commit: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-          EOF
-            
-            git commit -F commit_message.txt
-            git push
-            
-            echo "✅ Successfully updated Helm chart with new image tag"
+          # If triggered manually with a tag, use that for rollback.
+          # Otherwise, use the tag from the build job.
+          if [[ -n "${{ github.event.inputs.image_tag }}" ]]; then
+            echo "Manual deployment triggered. Using tag: ${{ github.event.inputs.image_tag }}"
+            TAG_TO_DEPLOY="${{ github.event.inputs.image_tag }}"
           else
-            echo "ℹ️ No changes to commit - image tag already up to date"
+            echo "Automated deployment triggered. Using tag from build job: ${{ needs.build-and-test.outputs.image_tag }}"
+            TAG_TO_DEPLOY="${{ needs.build-and-test.outputs.image_tag }}"
           fi
-
-  # Job 5: Trigger CD Pipeline
-  trigger-deployment:
-    runs-on: ubuntu-latest
-    needs: [update-helm-chart]
-    if: github.ref == 'refs/heads/main'
-
-    steps:
-      - name: Trigger CD Pipeline
-        run: |
-          echo "🚀 CI Pipeline completed successfully!"
-          echo "✅ Code tested and validated"
-          echo "✅ Docker image built and pushed: ${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}"
-          echo "✅ Helm chart updated in infra repository"
-          echo "🔄 CD Pipeline should be triggered automatically via repository dispatch or workflow_run event"
           
-          # Optionally trigger CD workflow explicitly
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.GH_PAT }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/subanalytics/infra-and-cicd/dispatches \
-            -d '{
-              "event_type": "deploy-user-auth-service",
-              "client_payload": {
-                "service": "user-auth-service",
-                "image_tag": "${{ github.sha }}",
-                "repository": "${{ github.repository }}",
-                "build_number": "${{ github.run_number }}"
-              }
-            }' || echo "Failed to trigger CD pipeline - it may trigger automatically"
+          # Set namespace from manual input or default to 'analytics'
+          NAMESPACE=${{ github.event.inputs.environment || 'analytics' }}
 
-  # Job 6: Cleanup on failure
-  cleanup-on-failure:
-    runs-on: ubuntu-latest
-    needs: [static-analysis, test, build-and-push, update-helm-chart]
-    if: failure()
+          echo "TAG_TO_DEPLOY=$TAG_TO_DEPLOY" >> $GITHUB_ENV
+          echo "NAMESPACE=$NAMESPACE" >> $GITHUB_ENV
 
-    steps:
-      - name: Cleanup failed build artifacts
+      - name: Deploy with Helm
         run: |
-          echo "❌ CI Pipeline failed - performing cleanup"
-          echo "Failed job details:"
-          echo "- Repository: ${{ github.repository }}"
-          echo "- Branch: ${{ github.ref }}"
-          echo "- Commit: ${{ github.sha }}"
-          echo "- Run Number: ${{ github.run_number }}"
+          echo "🚀 Deploying image ${{ env.TAG_TO_DEPLOY }} to namespace ${{ env.NAMESPACE }}..."
           
-          # Here you could add cleanup logic like:
-          # - Remove failed Docker images
-          # - Revert Helm chart changes
-          # - Send notifications
-          
-      - name: Send failure notification
-        continue-on-error: true
+          helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ./infra-and-cicd \
+            --namespace ${{ env.NAMESPACE }} \
+            --set ${{ env.SERVICE_NAME }}.image.tag=${{ env.TAG_TO_DEPLOY }} \
+            --atomic \
+            --create-namespace \
+            --wait \
+            --timeout 10m
+
+      - name: Verify Deployment Rollout
         run: |
-          # Add your notification logic here (Slack, email, etc.)
-          echo "🔔 Consider setting up failure notifications for production"
+          echo "=== Verifying deployment status ==="
+          kubectl rollout status deployment/${{ env.HELM_RELEASE_NAME }} -n ${{ env.NAMESPACE }} --timeout=5m
+          echo "✅ Deployment successful!"
+
+      - name: Display Deployment Summary
+        if: always()
+        run: |
+          echo "🎉 DEPLOYMENT SUMMARY 🎉"
+          echo "-----------------------------------"
+          echo "Service: ${{ env.SERVICE_NAME }}"
+          echo "Namespace: ${{ env.NAMESPACE }}"
+          echo "Status: ${{ job.status }}"
+          FINAL_IMAGE_TAG=$(kubectl get deployment ${{ env.HELM_RELEASE_NAME }} -n ${{ env.NAMESPACE }} -o jsonpath="{.spec.template.spec.containers[0].image}")
+          echo "Deployed Image: $FINAL_IMAGE_TAG"
+
+---
+
+## Key Changes and Considerations
+
+* **Single File Simplicity**: The entire build-test-deploy lifecycle is now defined in one file within your service's repository.
+* **Security Trade-Off ⚠️**: Your highly sensitive `KUBE_CONFIG_DATA` secret must now be stored in your microservice repository's secrets. This increases the security risk, as more developers typically have access to an application repo than a dedicated infrastructure repo.
+* **Helm Chart Location**: This workflow still assumes your Helm chart lives in a central `infra-and-cicd` repository. The `deploy-to-kubernetes` job checks out that repository to get the chart before running `helm upgrade`.
+* **Conditional Deployment**: The `if: success() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')` line is crucial. It ensures that the deployment job **only** runs when code is merged into your main production branch or when you explicitly trigger it manually. It prevents deployments from pull requests or feature branches.
+* **Less Reusability**: This pattern must be copied and adapted for each microservice, whereas the separated CD workflow was reusable for all services.
