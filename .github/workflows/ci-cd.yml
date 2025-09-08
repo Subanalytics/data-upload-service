@@ -1,17 +1,14 @@
 name: CI/CD - Data Upload Service
 
 on:
-  # Trigger build/test on pushes to any branch
   push:
     branches:
       - '**'
   
-  # Trigger build/test for pull requests targeting main
   pull_request:
     branches:
       - main
 
-  # Allow manual triggering for deployment or rollbacks
   workflow_dispatch:
     inputs:
       environment:
@@ -30,18 +27,14 @@ on:
 
 env:
   DOCKER_IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/data-upload-service
-  SERVICE_NAME: dataUploadService      # Must match the key in your Helm values.yaml
-  HELM_RELEASE_NAME: data-upload-service # The deployment name in Kubernetes
+  SERVICE_NAME: dataUploadService
+  HELM_RELEASE_NAME: data-upload-service
 
 jobs:
-  # ==================================
-  # CI STAGE: Build & Test
-  # ==================================
   build-and-test:
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.vars.outputs.image_tag }}
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -70,7 +63,6 @@ jobs:
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
       - name: Login to Docker Hub
-        # Only log in if we are actually going to push an image
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: docker/login-action@v3
         with:
@@ -78,7 +70,6 @@ jobs:
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
       - name: Build and push Docker image
-        # Only build and push on a merge to main or a manual trigger
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
         uses: docker/build-push-action@v5
         with:
@@ -90,8 +81,68 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ==================================
-  # CD STAGE: Deploy to Kubernetes
-  # ==================================
   deploy-to-kubernetes:
-    runs-on: self
+    runs-on: self-hosted
+    needs: build-and-test
+    if: success() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    # The 'steps' key below is correctly indented under 'deploy-to-kubernetes'
+    steps:
+      - name: Checkout infrastructure repository with Helm chart
+        uses: actions/checkout@v4
+        with:
+          repository: subanalytics/infra-and-cicd
+          path: infra-and-cicd
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 --decode > kubeconfig.yaml
+          echo "KUBECONFIG=$PWD/kubeconfig.yaml" >> $GITHUB_ENV
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+
+      - name: Set Deployment Variables
+        id: vars
+        run: |
+          if [[ -n "${{ github.event.inputs.image_tag }}" ]]; then
+            echo "Manual deployment triggered. Using tag: ${{ github.event.inputs.image_tag }}"
+            TAG_TO_DEPLOY="${{ github.event.inputs.image_tag }}"
+          else
+            echo "Automated deployment triggered. Using tag from build job: ${{ needs.build-and-test.outputs.image_tag }}"
+            TAG_TO_DEPLOY="${{ needs.build-and-test.outputs.image_tag }}"
+          fi
+          
+          NAMESPACE=${{ github.event.inputs.environment || 'analytics' }}
+
+          echo "TAG_TO_DEPLOY=$TAG_TO_DEPLOY" >> $GITHUB_ENV
+          echo "NAMESPACE=$NAMESPACE" >> $GITHUB_ENV
+
+      - name: Deploy with Helm
+        run: |
+          echo "🚀 Deploying image ${{ env.TAG_TO_DEPLOY }} to namespace ${{ env.NAMESPACE }}..."
+          
+          helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ./infra-and-cicd \
+            --namespace ${{ env.NAMESPACE }} \
+            --set ${{ env.SERVICE_NAME }}.image.tag=${{ env.TAG_TO_DEPLOY }} \
+            --atomic \
+            --create-namespace \
+            --wait \
+            --timeout 10m
+
+      - name: Verify Deployment Rollout
+        run: |
+          echo "=== Verifying deployment status ==="
+          kubectl rollout status deployment/${{ env.HELM_RELEASE_NAME }} -n ${{ env.NAMESPACE }} --timeout=5m
+          echo "✅ Deployment successful!"
+
+      - name: Display Deployment Summary
+        if: always()
+        run: |
+          echo "🎉 DEPLOYMENT SUMMARY 🎉"
+          echo "-----------------------------------"
+          echo "Service:        ${{ env.SERVICE_NAME }}"
+          echo "Namespace:      ${{ env.NAMESPACE }}"
+          echo "Status:         ${{ job.status }}"
+          FINAL_IMAGE_TAG=$(kubectl get deployment ${{ env.HELM_RELEASE_NAME }} -n ${{ env.NAMESPACE }} -o jsonpath="{.spec.template.spec.containers[0].image}")
+          echo "Deployed Image: $FINAL_IMAGE_TAG"
