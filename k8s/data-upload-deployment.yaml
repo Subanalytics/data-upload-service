@@ -22,7 +22,10 @@ spec:
         image: tush1809/data-upload:latest
         imagePullPolicy: Always
         ports:
-          - containerPort: 6000
+          - containerPort: 5000
+        env:
+          - name: PORT
+            value: "5000"   # ✅ Force app to listen on 5000
         resources:
           requests:
             cpu: "10m"
@@ -33,7 +36,7 @@ spec:
         livenessProbe:
           httpGet:
             path: /health
-            port: 6000
+            port: 5000
           initialDelaySeconds: 10
           periodSeconds: 10
           timeoutSeconds: 2
@@ -41,7 +44,7 @@ spec:
         readinessProbe:
           httpGet:
             path: /health
-            port: 6000
+            port: 5000
           initialDelaySeconds: 5
           periodSeconds: 5
           timeoutSeconds: 2
@@ -58,6 +61,5 @@ spec:
   ports:
     - protocol: TCP
       port: 5000
-      targetPort: 6000
+      targetPort: 5000
   type: ClusterIP
-
